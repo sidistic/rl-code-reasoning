@@ -1,217 +1,171 @@
-# 🤖 Simple RLAIF for Code Generation
+# RLAIF for Code Generation
 
-A minimal implementation of **RLAIF (Reinforcement Learning from AI Feedback)** for learning code generation. This project demonstrates the core concepts of RLAIF in under 500 lines of code.
+A beginner-friendly implementation of RLAIF (Reinforcement Learning from AI Feedback) for code generation in just 5 core scripts!
 
-## 🎯 What is RLAIF?
-
-**RLAIF** replaces human feedback with AI feedback in reinforcement learning:
-- **Traditional RLHF**: Human evaluators rate model outputs → expensive and slow
-- **RLAIF**: AI model evaluates outputs → scalable and fast
-
-## 📁 Project Structure (6 files only!)
+## 📁 Project Structure
 
 ```
-├── requirements.txt        # Dependencies
-├── simple_dataset.py       # Creates coding problems  
-├── reward_model.py         # AI reward model (core RLAIF!)
-├── rlaif_trainer.py        # Main RLAIF training logic
-├── train.py               # Training script
-├── evaluate.py           # Evaluation script
-└── README.md             # This file
+├── scrape_leetcode.py   # 1. Scrape coding problems
+├── train.py            # 2. Train model (local or SageMaker)
+├── evaluate.py         # 3. Evaluate trained model
+├── reward_model.py     # 4. Modular reward system
+├── rlaif_trainer.py    # 5. Core RLAIF implementation
+└── requirements.txt
 ```
 
-## 🚀 Quick Start
+## 🎯 Quick Start
 
 ### 1. Install Dependencies
 ```bash
-pip install -r requirements.txt
+pip install torch transformers datasets accelerate tqdm
+# For SageMaker: pip install sagemaker boto3
+# For LoRA: pip install peft
 ```
 
-### 2. See RLAIF Demo
+### 2. Get Training Data
 ```bash
-python train.py
+# Scrape Leetcode problems (or use mock data)
+python scrape_leetcode.py
 ```
-This shows how AI feedback works on good vs bad code.
 
 ### 3. Train Your Model
+
+**Local Training (Quick Test):**
 ```bash
-python train.py --episodes 20
+# Small model, few episodes
+python train.py --model microsoft/DialoGPT-small --episodes 5
+
+# Better model, more training
+python train.py --model Salesforce/codegen-350M-mono --episodes 20
+```
+
+**SageMaker Training (With GPU):**
+```bash
+python train.py --mode sagemaker --model Salesforce/codegen-350M-mono --episodes 30
 ```
 
 ### 4. Evaluate Results
 ```bash
+# Test on problems
 python evaluate.py
-```
 
-### 5. Interactive Testing
-```bash
+# Interactive mode
 python evaluate.py --interactive
 ```
 
-## 🧠 How RLAIF Works
+## 🧠 Understanding RLAIF
 
-1. **Policy Model**: The model we're training (starts with DialoGPT)
-2. **AI Reward Model**: Evaluates code quality (replaces humans!)
-3. **Training Loop**: 
-   - Generate code solutions
-   - Get AI rewards 
-   - Update policy with PPO
-   - Repeat!
+**Traditional RLHF:** Human rates outputs → Expensive & slow  
+**RLAIF Innovation:** AI rates outputs → Fast & scalable
 
-## 💡 Key Components
+### How It Works:
+1. **Generate:** Model creates code solutions
+2. **Evaluate:** AI gives rewards (execution, correctness, style)
+3. **Learn:** Model updates to generate better code
+4. **Repeat:** Iterate until performance improves
 
-### AI Reward Model (`reward_model.py`)
-```python
-# This is the magic of RLAIF!
-reward = ai_model.evaluate_code_solution(
-    prompt="Write a function to add numbers",
-    solution=generated_code,
-    test_input="add(3,5)", 
-    expected_output="8"
-)
-# Higher reward = better code
-```
+## 🔧 Customization
 
-### RLAIF Training (`rlaif_trainer.py`)
-```python
-# Core RLAIF training loop
-for episode in range(num_episodes):
-    # 1. Generate solutions with current policy
-    responses = model.generate(prompts)
-    
-    # 2. Get AI feedback (not human!)
-    rewards = ai_reward_model.evaluate(responses)
-    
-    # 3. Update policy to maximize AI rewards
-    ppo_trainer.step(prompts, responses, rewards)
-```
-
-## 📊 Example Training Output
-
-```
-🤖 Episode 1/20
-🤖 Generating code solutions...
-🧠 Getting AI feedback...
-Generated: def add_numbers print hello
-Reward: 0.245
-
-🔄 Running PPO update...
-Average reward: 0.245
-
-...
-
-🤖 Episode 20/20  
-Generated: def add_numbers(a, b):
-    return a + b
-Reward: 0.847
-
-✅ RLAIF training completed!
-```
-
-## 🎛️ Configuration Options
-
-### Basic Training
-```bash
-python train.py --episodes 10        # Quick training
-python train.py --episodes 50        # Better results
-```
-
-### Different Models
-```bash
-python train.py --model microsoft/DialoGPT-medium
-python train.py --model gpt2
-```
-
-### Custom Output
-```bash
-python train.py --output_dir ./my_model
-```
-
-## 📈 Understanding Results
-
-**Reward Scores:**
-- `0.0-0.3`: Poor code (syntax errors, wrong logic)
-- `0.3-0.6`: Okay code (works but inefficient)  
-- `0.6-1.0`: Good code (correct, clean, efficient)
-
-**Success Rate:**
-- `> 70%`: Excellent training
-- `40-70%`: Good progress
-- `< 40%`: Needs more episodes
-
-## 🔬 What You'll Learn
-
-1. **RLAIF Basics**: How AI feedback replaces human evaluation
-2. **PPO Training**: Reinforcement learning for language models
-3. **Reward Design**: How to create effective AI reward functions
-4. **Code Evaluation**: Automated assessment of generated code
-
-## 🛠️ Customization Ideas
-
-### Add New Problems
-Edit `simple_dataset.py`:
-```python
-problems = [
-    {
-        "prompt": "Write a function to sort a list",
-        "test_input": "sort_list([3,1,4,1,5])",
-        "expected_output": "[1,1,3,4,5]",
-        "difficulty": "medium"
-    }
-]
-```
-
-### Improve Reward Model
+### Different Reward Models
 Edit `reward_model.py`:
 ```python
-def _evaluate_code_quality(self, solution):
-    score = 0.0
-    
-    # Add your own criteria
-    if "docstring" in solution:
-        score += 0.1
-    if "error handling" in solution:
-        score += 0.1
-        
-    return score
+# Execution-focused
+model = CodeExecutionReward(weights={
+    "correctness": 0.7,
+    "execution": 0.2,
+    "style": 0.1
+})
+
+# AI feedback
+model = AIFeedbackReward()
+
+# Hybrid approach
+model = create_reward_model("hybrid")
 ```
 
-### Use Better Base Models
-```python
-# In train.py, try:
-trainer = RLAIFTrainer("microsoft/CodeBERT-base")
-trainer = RLAIFTrainer("Salesforce/codegen-350M-mono")
+### Add Your Own Problems
+Edit `scrape_leetcode.py` or create JSON:
+```json
+{
+  "prompt": "Write a function to find max in array",
+  "solution": "def find_max(arr):\n    return max(arr)",
+  "test_cases": [
+    {"input": "find_max([1,5,3])", "output": "5"}
+  ]
+}
 ```
+
+### Scale Up
+```bash
+# Larger models
+python train.py --model codellama/CodeLlama-7b-Python-hf --use_lora
+
+# More episodes
+python train.py --episodes 100
+
+# Bigger batches (edit rlaif_trainer.py)
+batch_size = 8
+```
+
+## 📊 Expected Results
+
+**Before Training:**
+```
+Prompt: Write a function to add two numbers
+Output: Hello world! I like coding...
+Reward: 0.1
+```
+
+**After Training:**
+```
+Prompt: Write a function to add two numbers  
+Output: def add(a, b):
+    return a + b
+Reward: 0.95
+```
+
+## 💡 Key Concepts
+
+- **Policy Model:** The model learning to generate code
+- **Reward Model:** AI that evaluates code quality
+- **PPO:** Algorithm that updates model carefully
+- **Value Head:** Predicts expected rewards
+- **Advantages:** How much better/worse than expected
 
 ## 🐛 Troubleshooting
 
-**GPU Memory Issues:**
-```bash
-# Use smaller model
-python train.py --model microsoft/DialoGPT-small
+**Out of Memory:**
+- Use smaller model: `--model microsoft/DialoGPT-small`
+- Enable LoRA: `--use_lora`
+- Reduce batch size in `rlaif_trainer.py`
 
-# Reduce batch size (edit rlaif_trainer.py)
-batch_size=1
-```
+**No Improvement:**
+- Increase episodes: `--episodes 50`
+- Check reward model is working
+- Verify dataset quality
 
 **Slow Training:**
-- Start with `--episodes 5` for testing
-- Use GPU if available
-- Consider smaller models for experimentation
+- Use GPU (CUDA)
+- Try SageMaker with better instance
+- Start with fewer problems
 
-**Poor Results:**
-- Increase episodes: `--episodes 50`
-- Check if rewards are increasing
-- Verify test cases in dataset
+## 🚀 Next Steps
 
-## 🎯 Next Steps
+1. **Experiment with Rewards:** Modify `reward_model.py` weights
+2. **Add Problems:** Expand dataset with real Leetcode problems  
+3. **Try Larger Models:** CodeLlama, StarCoder, etc.
+4. **Advanced RL:** Implement DPO, add KL penalties
+5. **Production:** Add logging, checkpointing, distributed training
 
-Once you understand this simple RLAIF implementation:
+## 📚 Learn More
 
-1. **Scale Up**: Use larger models (CodeT5, StarCoder)
-2. **Better Rewards**: Add execution testing, style checking  
-3. **More Data**: Create larger, more diverse problem sets
-4. **Advanced RL**: Try different algorithms (DPO, PPO variants)
+- [Original RLHF Paper](https://arxiv.org/abs/2203.02155)
+- [Constitutional AI (RLAIF)](https://arxiv.org/abs/2212.08073)
+- [PPO Algorithm](https://arxiv.org/abs/1707.06347)
+
+---
+
+**Happy Learning!** 🎉 You now have a working RLAIF system that's simple to understand and easy to extend!
 
 ## 📚 Key Papers
 

@@ -1,196 +1,214 @@
 """
-AI Reward Model for RLAIF using Code-specific models
+Modular Reward Model for RLAIF
+Easy to customize and experiment with different reward strategies
 """
 
 import torch
 import re
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import List, Dict, Any
+from abc import ABC, abstractmethod
+from typing import List, Dict, Tuple
 
-class AIRewardModel:
-    """
-    AI-based reward model using a code-specific model for evaluation.
-    """
+class BaseRewardModel(ABC):
+    """Base class for reward models"""
     
-    def __init__(self, model_name: str = "codellama/CodeLlama-7b-Python-hf"):
-        """Initialize the AI reward model with a code-specific model."""
-        print(f"Loading AI reward model: {model_name}")
-        
-        # Use a smaller model for reward evaluation to save memory
-        # Options: "microsoft/codebert-base", "Salesforce/codet5-small", "codellama/CodeLlama-7b-Python-hf"
-        if "CodeLlama-7b" in model_name:
-            # Use a smaller model for rewards to save GPU memory
-            self.model_name = "Salesforce/codet5-small"
-        else:
-            self.model_name = model_name
-            
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        print("✅ AI Reward Model loaded successfully")
+    @abstractmethod
+    def compute_reward(self, prompt: str, solution: str, test_input: str, expected_output: str) -> float:
+        """Compute reward for a solution"""
+        pass
     
-    def evaluate_code_solution(self, prompt: str, solution: str, test_input: str, expected_output: str) -> float:
-        """
-        Evaluate a code solution using AI feedback.
-        
-        Returns:
-            Reward score between 0 and 1
-        """
-        
-        # Step 1: Basic syntax check
-        syntax_score = self._check_syntax(solution)
-        
-        # Step 2: Try to execute and check correctness
-        correctness_score = self._evaluate_correctness(solution, test_input, expected_output)
-        
-        # Step 3: Code quality check
-        quality_score = self._evaluate_code_quality(solution)
-        
-        # Weighted combination
-        final_reward = (
-            0.5 * correctness_score +  # Correctness is most important
-            0.3 * quality_score +       # Code quality
-            0.2 * syntax_score          # Basic syntax
-        )
-        
-        return max(0.0, min(1.0, final_reward))
+    def batch_compute(self, prompts: List[str], solutions: List[str], 
+                     test_inputs: List[str], expected_outputs: List[str]) -> List[float]:
+        """Compute rewards for batch"""
+        return [
+            self.compute_reward(p, s, ti, eo) 
+            for p, s, ti, eo in zip(prompts, solutions, test_inputs, expected_outputs)
+        ]
+
+class CodeExecutionReward(BaseRewardModel):
+    """Reward based on code execution and correctness"""
     
-    def _check_syntax(self, solution: str) -> float:
-        """Check if code has valid Python syntax."""
+    def __init__(self, weights: Dict[str, float] = None):
+        """Initialize with customizable weights"""
+        self.weights = weights or {
+            "syntax": 0.2,      # Valid Python syntax
+            "execution": 0.3,   # Runs without errors
+            "correctness": 0.4, # Produces correct output
+            "style": 0.1        # Code quality/style
+        }
+    
+    def compute_reward(self, prompt: str, solution: str, test_input: str, expected_output: str) -> float:
+        """Compute reward based on execution and correctness"""
+        scores = {}
+        
+        # 1. Syntax score
+        scores["syntax"] = self._check_syntax(solution)
+        
+        # 2. Execution and correctness
+        exec_score, correct_score = self._execute_and_check(solution, test_input, expected_output)
+        scores["execution"] = exec_score
+        scores["correctness"] = correct_score
+        
+        # 3. Style score
+        scores["style"] = self._check_style(solution)
+        
+        # Weighted sum
+        total = sum(scores[k] * self.weights[k] for k in scores)
+        return max(0.0, min(1.0, total))
+    
+    def _check_syntax(self, code: str) -> float:
+        """Check if code has valid syntax"""
         try:
-            compile(solution, '<string>', 'exec')
+            compile(code, '<string>', 'exec')
             return 1.0
         except SyntaxError:
             return 0.0
     
-    def _evaluate_code_quality(self, solution: str) -> float:
-        """Evaluate basic code quality metrics."""
-        score = 0.0
-        
-        # Check for function definition
-        if "def " in solution:
-            score += 0.25
-        
-        # Check for return statement
-        if "return" in solution:
-            score += 0.25
-        
-        # Check for reasonable length
-        lines = [line for line in solution.split('\n') if line.strip()]
-        if 1 <= len(lines) <= 15:
-            score += 0.25
-        
-        # Check if it's not just a print statement
-        if "def" in solution and not solution.strip().startswith("print"):
-            score += 0.25
-        
-        return score
-    
-    def _evaluate_correctness(self, solution: str, test_input: str, expected_output: str) -> float:
-        """Try to evaluate correctness by executing code."""
+    def _execute_and_check(self, code: str, test_input: str, expected_output: str) -> Tuple[float, float]:
+        """Execute code and check correctness"""
         try:
             # Extract function name
-            func_match = re.search(r'def\s+(\w+)', solution)
+            func_match = re.search(r'def\s+(\w+)', code)
             if not func_match:
-                return 0.0
+                return 0.0, 0.0
             
-            func_name = func_match.group(1)
-            
-            # Create safe execution environment
+            # Execute code
             exec_globals = {}
-            exec_locals = {}
+            exec(code, exec_globals)
             
-            # Execute the solution
-            exec(solution, exec_globals, exec_locals)
+            # Run test
+            result = eval(test_input, exec_globals)
+            expected = eval(expected_output) if isinstance(expected_output, str) else expected_output
             
-            # Get the function
-            if func_name not in exec_locals:
-                return 0.0
+            # Execution succeeded
+            exec_score = 1.0
             
-            func = exec_locals[func_name]
+            # Check correctness
+            correct_score = 1.0 if result == expected else 0.0
             
-            # Parse and execute test
-            if "(" in test_input and ")" in test_input:
-                # Extract arguments safely
-                args_str = test_input[test_input.find("(")+1:test_input.find(")")]
-                
-                # Simple parsing for basic types
-                args = []
-                for arg in args_str.split(","):
-                    arg = arg.strip()
-                    if arg.startswith("'") or arg.startswith('"'):
-                        args.append(arg[1:-1])  # String
-                    elif arg.isdigit():
-                        args.append(int(arg))   # Integer
-                    elif arg.startswith("["):
-                        args.append(eval(arg))  # List (simple eval)
-                    else:
-                        try:
-                            args.append(float(arg))  # Float
-                        except:
-                            args.append(arg)  # Keep as string
-                
-                # Call function
-                result = func(*args)
-                
-                # Compare with expected
-                expected = eval(expected_output)
-                
-                if result == expected:
-                    return 1.0
-                elif str(result) == str(expected):
-                    return 0.9  # String representation matches
-                else:
-                    return 0.2  # Wrong answer
+            return exec_score, correct_score
             
         except Exception as e:
-            return 0.0
+            return 0.0, 0.0
+    
+    def _check_style(self, code: str) -> float:
+        """Basic code style checks"""
+        score = 0.0
         
-        return 0.0
-
-    def batch_evaluate(self, prompts: List[str], solutions: List[str], 
-                      test_inputs: List[str], expected_outputs: List[str]) -> List[float]:
-        """Evaluate multiple solutions in batch."""
-        rewards = []
+        # Has function definition
+        if "def " in code:
+            score += 0.3
         
-        for prompt, solution, test_input, expected_output in zip(
-            prompts, solutions, test_inputs, expected_outputs
-        ):
-            reward = self.evaluate_code_solution(
-                prompt, solution, test_input, expected_output
-            )
-            rewards.append(reward)
+        # Has return statement
+        if "return" in code:
+            score += 0.3
         
-        return rewards
+        # Reasonable length
+        lines = [l for l in code.split('\n') if l.strip()]
+        if 1 <= len(lines) <= 20:
+            score += 0.2
+        
+        # Not just print
+        if "def" in code and not code.strip().startswith("print"):
+            score += 0.2
+        
+        return score
 
+class AIFeedbackReward(BaseRewardModel):
+    """Reward using AI model feedback (simplified)"""
+    
+    def __init__(self, model_name: str = None):
+        """Initialize with AI model for feedback"""
+        # In production, load an actual model
+        # For simplicity, using heuristics
+        self.model_name = model_name or "mock-ai-model"
+    
+    def compute_reward(self, prompt: str, solution: str, test_input: str, expected_output: str) -> float:
+        """Use AI to evaluate solution quality"""
+        # Simplified AI evaluation
+        score = 0.0
+        
+        # Check if solution addresses the prompt
+        prompt_keywords = re.findall(r'\b\w+\b', prompt.lower())
+        solution_lower = solution.lower()
+        
+        keyword_matches = sum(1 for kw in prompt_keywords if kw in solution_lower)
+        score += min(0.3, keyword_matches * 0.05)
+        
+        # Check structure
+        if "def" in solution and "return" in solution:
+            score += 0.4
+        
+        # Length appropriateness
+        if 10 < len(solution) < 500:
+            score += 0.3
+        
+        return score
 
+class HybridReward(BaseRewardModel):
+    """Combine multiple reward models"""
+    
+    def __init__(self, models: List[Tuple[BaseRewardModel, float]]):
+        """Initialize with list of (model, weight) tuples"""
+        self.models = models
+        total_weight = sum(w for _, w in models)
+        self.models = [(m, w/total_weight) for m, w in models]  # Normalize
+    
+    def compute_reward(self, prompt: str, solution: str, test_input: str, expected_output: str) -> float:
+        """Compute weighted average of multiple rewards"""
+        total = 0.0
+        for model, weight in self.models:
+            reward = model.compute_reward(prompt, solution, test_input, expected_output)
+            total += reward * weight
+        return total
+
+# Factory function for easy model creation
+def create_reward_model(model_type: str = "execution", **kwargs) -> BaseRewardModel:
+    """Create reward model by type"""
+    if model_type == "execution":
+        return CodeExecutionReward(**kwargs)
+    elif model_type == "ai":
+        return AIFeedbackReward(**kwargs)
+    elif model_type == "hybrid":
+        # Default hybrid model
+        return HybridReward([
+            (CodeExecutionReward(), 0.7),
+            (AIFeedbackReward(), 0.3)
+        ])
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+# Example usage and testing
 if __name__ == "__main__":
-    # Test the reward model
-    print("Testing AI Reward Model...")
+    print("🧪 Testing Reward Models\n")
     
-    # Use a small model for testing
-    reward_model = AIRewardModel("Salesforce/codet5-small")
-    
-    # Test good solution
-    prompt = "Write a Python function that adds two numbers."
-    good_solution = """def add_numbers(a, b):
-    return a + b"""
-    
-    reward = reward_model.evaluate_code_solution(
-        prompt, good_solution, "add_numbers(3, 5)", "8"
-    )
-    print(f"Good solution reward: {reward:.3f}")
-    
-    # Test bad solution
+    # Test data
+    prompt = "Write a Python function that adds two numbers"
+    good_solution = "def add(a, b):\n    return a + b"
     bad_solution = "print('hello')"
-    bad_reward = reward_model.evaluate_code_solution(
-        prompt, bad_solution, "add_numbers(3, 5)", "8"
-    )
-    print(f"Bad solution reward: {bad_reward:.3f}")
+    test_input = "add(2, 3)"
+    expected = "5"
+    
+    # Test different reward models
+    models = {
+        "Execution": CodeExecutionReward(),
+        "AI Feedback": AIFeedbackReward(),
+        "Hybrid": create_reward_model("hybrid")
+    }
+    
+    for name, model in models.items():
+        print(f"\n{name} Model:")
+        good_reward = model.compute_reward(prompt, good_solution, test_input, expected)
+        bad_reward = model.compute_reward(prompt, bad_solution, test_input, expected)
+        print(f"  Good solution: {good_reward:.3f}")
+        print(f"  Bad solution: {bad_reward:.3f}")
+    
+    # Custom weights example
+    print("\n\nCustom Execution Reward (syntax-heavy):")
+    custom_model = CodeExecutionReward(weights={
+        "syntax": 0.5,
+        "execution": 0.2,
+        "correctness": 0.2,
+        "style": 0.1
+    })
+    reward = custom_model.compute_reward(prompt, good_solution, test_input, expected)
+    print(f"  Reward: {reward:.3f}")
