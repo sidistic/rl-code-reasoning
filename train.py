@@ -1,129 +1,141 @@
 """
-Simple RLAIF Training Script
-Run this to start training your code generation model with AI feedback.
+Local RLAIF Training Script for Code Generation
+Test locally before running on SageMaker.
 """
 
 import argparse
 import torch
-from simple_dataset import create_dataset, save_dataset
-from rlaif_trainer import RLAIFTrainer
+from simple_dataset import create_dataset
+from rlaif_trainer import RLAIFCodeTrainer
 
 def main():
     parser = argparse.ArgumentParser(description="Train code generation model with RLAIF")
-    parser.add_argument("--model", default="microsoft/DialoGPT-small", help="Base model to train")
-    parser.add_argument("--episodes", type=int, default=20, help="Number of training episodes")
-    parser.add_argument("--output_dir", default="./trained_model", help="Where to save the model")
-    parser.add_argument("--create_data", action="store_true", help="Create new dataset")
-    parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
+    
+    # Model selection
+    parser.add_argument("--model", default="Salesforce/codegen-350M-mono", 
+                       choices=[
+                           "microsoft/DialoGPT-small",  # For CPU testing
+                           "Salesforce/codegen-350M-mono",
+                           "WizardLM/WizardCoder-1B-V1.0",
+                           "Salesforce/codegen-2B-mono",
+                           "codellama/CodeLlama-7b-Python-hf"
+                       ],
+                       help="Model to train")
+    
+    parser.add_argument("--episodes", type=int, default=10, help="Number of training episodes")
+    parser.add_argument("--output_dir", default="./trained_model", help="Where to save model")
+    parser.add_argument("--use_lora", action="store_true", help="Use LoRA for 7B models")
     
     args = parser.parse_args()
     
-    print("🧠 RLAIF Code Generation Training")
-    print("=" * 40)
+    print("🧠 RLAIF Code Generation Training (Local)")
+    print("=" * 50)
     print(f"Model: {args.model}")
     print(f"Episodes: {args.episodes}")
     print(f"Output: {args.output_dir}")
-    print()
     
     # Check GPU
     if torch.cuda.is_available():
-        print(f"🚀 Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
-        print("💻 Using CPU (training will be slow)")
-    print()
+        print("⚠️ No GPU - training will be slow!")
+        if "7b" in args.model.lower():
+            print("❌ Cannot run 7B models without GPU!")
+            return
     
-    # Create or load dataset
-    if args.create_data:
-        print("📊 Creating new dataset...")
-        train_dataset, test_dataset = save_dataset()
-    else:
-        print("📊 Loading dataset...")
-        train_dataset, test_dataset = create_dataset()
-    
-    # Initialize trainer
-    print("🤖 Initializing RLAIF trainer...")
-    trainer = RLAIFTrainer(model_name=args.model)
-    
-    if not args.eval_only:
-        # Show example before training
-        print("\n🔍 Example generation BEFORE training:")
-        sample_prompt = "Write a Python function that adds two numbers."
-        before_response = trainer.generate_sample(sample_prompt)
-        print(f"Prompt: {sample_prompt}")
-        print(f"Generated: {before_response.strip()}")
-        
-        # Train the model
-        print(f"\n🚀 Starting RLAIF training...")
-        trainer.train(train_dataset, num_episodes=args.episodes)
-        
-        # Show example after training
-        print("\n🔍 Example generation AFTER training:")
-        after_response = trainer.generate_sample(sample_prompt)
-        print(f"Prompt: {sample_prompt}")
-        print(f"Generated: {after_response.strip()}")
-        
-        # Save the model
-        trainer.save_model(args.output_dir)
-    
-    # Evaluate the model
-    print("\n📊 Evaluating model performance...")
-    results = trainer.evaluate(test_dataset)
-    
-    print("\n🎉 Training completed!")
-    print(f"Final average reward: {results['average_reward']:.3f}")
-    print(f"Success rate: {results['success_rate']:.3f}")
-    
-    if not args.eval_only:
-        print(f"Model saved to: {args.output_dir}")
-
-def demo():
-    """Run a quick demo to show how RLAIF works."""
-    print("🎮 RLAIF Demo - See How AI Feedback Works")
-    print("=" * 50)
-    
-    # Create small dataset
+    # Create dataset
+    print("\n📊 Creating dataset...")
     train_dataset, test_dataset = create_dataset()
     
-    # Show the concept
+    # Initialize trainer
+    print("\n🤖 Initializing RLAIF trainer...")
+    try:
+        trainer = RLAIFCodeTrainer(
+            model_name=args.model,
+            use_lora=args.use_lora or "7b" in args.model.lower()
+        )
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+        print("💡 Try a smaller model like 'Salesforce/codegen-350M-mono'")
+        return
+    
+    # Show initial performance
+    print("\n🔍 Testing BEFORE training:")
+    test_prompts = [
+        "Write a Python function that adds two numbers.",
+        "Write a Python function that checks if a number is even."
+    ]
+    
+    for prompt in test_prompts[:1]:
+        response = trainer.generate_sample(prompt)
+        print(f"Prompt: {prompt}")
+        print(f"Generated: {response.strip()[:100]}...")
+        print()
+    
+    # Train
+    print(f"🚀 Starting RLAIF training for {args.episodes} episodes...")
+    trainer.train(train_dataset, num_episodes=args.episodes)
+    
+    # Show final performance
+    print("\n🔍 Testing AFTER training:")
+    for prompt in test_prompts[:1]:
+        response = trainer.generate_sample(prompt)
+        print(f"Prompt: {prompt}")
+        print(f"Generated: {response.strip()[:100]}...")
+        print()
+    
+    # Save model
+    trainer.save_model(args.output_dir)
+    print(f"\n✅ Model saved to {args.output_dir}")
+    print("\n🎉 Training completed!")
+
+def demo():
+    """Quick demo showing RLAIF concept."""
+    print("🎮 RLAIF Demo - Code Generation with AI Feedback")
+    print("=" * 60)
+    
     from reward_model import AIRewardModel
     
-    print("1️⃣ Creating AI Reward Model...")
-    reward_model = AIRewardModel()
+    # Create reward model
+    print("1️⃣ Loading AI Reward Model...")
+    reward_model = AIRewardModel("Salesforce/codet5-small")
     
-    print("\n2️⃣ Testing AI Feedback on different solutions:")
+    print("\n2️⃣ Testing AI feedback on code solutions:")
     
     prompt = "Write a Python function that adds two numbers."
-    test_input = "add_numbers(3, 5)"
-    expected_output = "8"
     
-    # Good solution
-    good_solution = """def add_numbers(a, b):
-    return a + b"""
+    # Test different solutions
+    solutions = [
+        ("✅ Good", "def add_numbers(a, b):\n    return a + b"),
+        ("❌ Bad", "print('hello world')"),
+        ("🔄 Okay", "def add(x, y):\n    result = x + y")
+    ]
     
-    # Bad solution
-    bad_solution = """print("hello world")"""
+    for label, solution in solutions:
+        reward = reward_model.evaluate_code_solution(
+            prompt, solution, "add_numbers(3, 5)", "8"
+        )
+        print(f"\n{label} solution:")
+        print(f"Code: {solution}")
+        print(f"AI Reward: {reward:.3f}")
     
-    # Test both
-    good_reward = reward_model.evaluate_code_solution(prompt, good_solution, test_input, expected_output)
-    bad_reward = reward_model.evaluate_code_solution(prompt, bad_solution, test_input, expected_output)
+    print("\n3️⃣ How RLAIF trains:")
+    print("• Model generates code")
+    print("• AI evaluates quality (no humans!)")
+    print("• Model learns from AI rewards")
+    print("• Repeat → Better code!")
     
-    print(f"\n✅ Good solution reward: {good_reward:.3f}")
-    print(f"❌ Bad solution reward: {bad_reward:.3f}")
-    
-    print(f"\n3️⃣ This is how RLAIF works:")
-    print("- AI evaluates solutions instead of humans")
-    print("- Higher rewards for better code")
-    print("- Model learns to maximize AI rewards")
-    print("- Result: Better code generation!")
-    
-    print(f"\n🚀 Now run: python train.py --episodes 10")
+    print("\n🚀 Ready to train? Try these commands:")
+    print("\nLocal (small model):")
+    print("  python train.py --model Salesforce/codegen-350M-mono --episodes 10")
+    print("\nSageMaker (with GPU):")
+    print("  python launch_sagemaker_training.py --model Salesforce/codegen-350M-mono --episodes 30")
 
 if __name__ == "__main__":
     import sys
     
     if len(sys.argv) == 1:
-        # No arguments provided, run demo
         demo()
     else:
-        # Arguments provided, run training
         main()
