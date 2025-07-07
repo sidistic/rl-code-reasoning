@@ -1,8 +1,24 @@
-# Minimal RLAIF Requirements
+# Core dependencies
 torch>=2.0.0
 transformers>=4.30.0
-trl>=0.7.0
 datasets>=2.14.0
 accelerate>=0.20.0
 numpy>=1.24.0
 tqdm>=4.65.0
+
+# Optional for advanced features
+# Uncomment as needed:
+
+# For LoRA/PEFT (efficient training)
+# peft>=0.6.0
+
+# For SageMaker deployment
+# sagemaker>=2.190.0
+# boto3>=1.26.0
+
+# For 8-bit quantization
+# bitsandbytes>=0.41.0
+
+# For better logging
+# tensorboard>=2.14.0
+# wandb>=0.15.0

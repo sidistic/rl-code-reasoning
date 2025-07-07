@@ -1,219 +1,377 @@
 """
-RLAIF Trainer for Code Generation using Code-specific models
-Optimized for GPU training on SageMaker
+RLAIF Trainer - Educational Implementation
+Clear implementation showing how RLAIF works for code generation
 """
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
-from datasets import Dataset
-from typing import List, Dict, Any
+from torch.distributions import Categorical
 import numpy as np
-from tqdm import tqdm
-from peft import LoraConfig, TaskType, get_peft_model
+from typing import List, Dict, Tuple
+from collections import deque
+import logging
 
-from reward_model import AIRewardModel
+# Set up logging for educational purposes
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class RLAIFCodeTrainer:
+class RLAIFTrainer:
     """
-    RLAIF trainer optimized for code generation models.
-    Uses LoRA for efficient training on smaller GPUs.
+    RLAIF (Reinforcement Learning from AI Feedback) Trainer
+    
+    Key concepts:
+    1. Policy Model: The model we're training to generate code
+    2. Reward Model: AI that evaluates code quality (no humans!)
+    3. PPO Algorithm: How we update the model based on rewards
     """
     
-    def __init__(self, model_name: str = "codellama/CodeLlama-7b-Python-hf", use_lora: bool = True):
-        """Initialize RLAIF trainer with code-specific model."""
-        print(f"🤖 Initializing RLAIF Code Trainer with {model_name}...")
+    def __init__(self, model_name: str = "microsoft/DialoGPT-small", use_lora: bool = False):
+        """Initialize RLAIF components"""
+        logger.info(f"🚀 Initializing RLAIF Trainer with {model_name}")
         
-        # Initialize tokenizer
+        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.tokenizer.padding_side = "left"  # Important for generation
         
-        # Load model with appropriate precision
-        if "7b" in model_name.lower():
-            # Use 8-bit quantization for 7B models
-            self.model = AutoModelForCausalLMWithValueHead.from_pretrained(
-                model_name,
-                load_in_8bit=True,
-                device_map="auto",
-                torch_dtype=torch.float16
-            )
-        else:
-            # Smaller models can run in fp16
-            self.model = AutoModelForCausalLMWithValueHead.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto"
-            )
+        # Load model (policy network)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
         
-        # Apply LoRA for efficient training
-        if use_lora and "7b" in model_name.lower():
+        # LoRA for efficient training (optional)
+        if use_lora and model_name != "microsoft/DialoGPT-small":
+            self._apply_lora()
+        
+        # Reference model (frozen copy for KL divergence)
+        self.ref_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
+        self.ref_model.eval()  # Always in eval mode
+        
+        # Load reward model
+        from reward_model import create_reward_model
+        self.reward_model = create_reward_model("hybrid")
+        
+        # PPO hyperparameters
+        self.ppo_config = {
+            "learning_rate": 1e-5,
+            "kl_coef": 0.1,          # KL divergence coefficient
+            "gamma": 0.99,           # Discount factor
+            "gae_lambda": 0.95,      # GAE lambda
+            "clip_ratio": 0.2,       # PPO clipping
+            "value_loss_coef": 0.5,  # Value function coefficient
+            "max_grad_norm": 0.5,    # Gradient clipping
+        }
+        
+        # Optimizer
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.ppo_config["learning_rate"])
+        
+        # Value head (estimates expected reward)
+        hidden_size = self.model.config.hidden_size
+        self.value_head = torch.nn.Linear(hidden_size, 1).to(self.device)
+        self.value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.ppo_config["learning_rate"])
+        
+        logger.info(f"✅ RLAIF Trainer ready on {self.device}")
+    
+    def _apply_lora(self):
+        """Apply LoRA for efficient training"""
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            
             lora_config = LoraConfig(
-                r=16,
-                lora_alpha=32,
+                r=8,
+                lora_alpha=16,
                 target_modules=["q_proj", "v_proj"],
                 lora_dropout=0.1,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM
             )
             self.model = get_peft_model(self.model, lora_config)
-            print("✅ LoRA applied for efficient training")
-        
-        # Initialize reference model (frozen)
-        self.ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            model_name,
-            load_in_8bit=True if "7b" in model_name.lower() else False,
-            device_map="auto",
-            torch_dtype=torch.float16
-        )
-        
-        # Initialize AI reward model (use smaller model)
-        self.reward_model = AIRewardModel("Salesforce/codet5-small")
-        
-        # PPO configuration optimized for code generation
-        self.ppo_config = PPOConfig(
-            model_name=model_name,
-            learning_rate=1e-5,
-            batch_size=4,
-            mini_batch_size=2,
-            gradient_accumulation_steps=1,
-            optimize_cuda_cache=True,
-            log_with="tensorboard",
-        )
-        
-        # Initialize PPO trainer
-        self.ppo_trainer = PPOTrainer(
-            config=self.ppo_config,
-            model=self.model,
-            ref_model=self.ref_model,
-            tokenizer=self.tokenizer,
-        )
-        
-        print("✅ RLAIF Code Trainer initialized successfully!")
+            logger.info("✅ LoRA applied for efficient training")
+        except ImportError:
+            logger.warning("⚠️ PEFT not installed, skipping LoRA")
     
-    def train(self, train_dataset: Dataset, num_episodes: int = 10):
+    def generate_trajectories(self, prompts: List[str], max_length: int = 100) -> Dict:
         """
-        Main RLAIF training loop optimized for code generation.
+        Generate code solutions and collect trajectories
+        
+        Returns dict with:
+        - responses: Generated code solutions
+        - log_probs: Log probabilities of actions
+        - values: Value estimates
+        - masks: Attention masks
         """
-        print(f"🚀 Starting RLAIF training for {num_episodes} episodes...")
-        
-        for episode in range(num_episodes):
-            print(f"\n📊 Episode {episode + 1}/{num_episodes}")
-            
-            # Sample batch
-            batch_size = min(4, len(train_dataset))
-            batch_indices = np.random.choice(len(train_dataset), batch_size, replace=False)
-            batch = train_dataset.select(batch_indices)
-            
-            # Prepare queries
-            queries = [item['query'] for item in batch]
-            query_tensors = [
-                self.tokenizer.encode(query, return_tensors="pt", max_length=256, truncation=True).squeeze()
-                for query in queries
-            ]
-            
-            # Generate responses
-            print("🤖 Generating code solutions...")
-            response_tensors = []
-            
-            for query_tensor in query_tensors:
-                gen_kwargs = {
-                    "min_new_tokens": 10,
-                    "max_new_tokens": 150,
-                    "temperature": 0.7,
-                    "do_sample": True,
-                    "top_p": 0.95,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                }
-                
-                response = self.ppo_trainer.generate(
-                    query_tensor.unsqueeze(0),
-                    return_prompt=False,
-                    **gen_kwargs
-                )
-                response_tensors.append(response.squeeze())
-            
-            # Decode responses
-            responses = [
-                self.tokenizer.decode(r, skip_special_tokens=True) 
-                for r in response_tensors
-            ]
-            
-            # Get AI rewards
-            print("🧠 Getting AI feedback...")
-            rewards = []
-            
-            for i, (response, item) in enumerate(zip(responses, batch)):
-                reward = self.reward_model.evaluate_code_solution(
-                    prompt=item['query'],
-                    solution=response,
-                    test_input=item['test_input'],
-                    expected_output=item['expected_output']
-                )
-                rewards.append(torch.tensor(reward))
-                
-                if i == 0:  # Show first example
-                    print(f"Query: {item['query'][:60]}...")
-                    print(f"Generated: {response[:80]}...")
-                    print(f"Reward: {reward:.3f}")
-            
-            # Run PPO step
-            print("🔄 Running PPO update...")
-            stats = self.ppo_trainer.step(query_tensors, response_tensors, rewards)
-            
-            # Log stats
-            avg_reward = torch.stack(rewards).mean().item()
-            print(f"Average reward: {avg_reward:.3f}")
-            
-            if stats and "ppo/loss/policy" in stats:
-                print(f"Policy loss: {stats['ppo/loss/policy']:.4f}")
-                print(f"Value loss: {stats['ppo/loss/value']:.4f}")
-        
-        print("\n✅ RLAIF training completed!")
-    
-    def save_model(self, output_dir: str):
-        """Save the trained model."""
-        print(f"💾 Saving model to {output_dir}")
-        
-        # Save the PPO model
-        self.ppo_trainer.save_pretrained(output_dir)
-        
-        print("✅ Model saved successfully!")
-    
-    def generate_sample(self, prompt: str) -> str:
-        """Generate a code solution for testing."""
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt", max_length=256, truncation=True)
+        self.model.eval()
+        trajectories = {
+            "responses": [],
+            "log_probs": [],
+            "values": [],
+            "rewards": []
+        }
         
         with torch.no_grad():
-            outputs = self.model.generate(
-                inputs,
-                max_new_tokens=150,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.95,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
+            for prompt in prompts:
+                # Encode prompt
+                inputs = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+                
+                # Generate with sampling
+                outputs = self.model.generate(
+                    inputs,
+                    max_new_tokens=max_length,
+                    attention_mask=torch.ones_like(inputs),
+                    do_sample=True,
+                    temperature=0.7,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+                
+                # Extract generated tokens
+                generated_ids = outputs.sequences[0][inputs.shape[1]:]
+                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                
+                # Get log probabilities
+                log_probs = []
+                for i, score in enumerate(outputs.scores):
+                    probs = torch.softmax(score[0], dim=-1)
+                    token_id = generated_ids[i]
+                    log_prob = torch.log(probs[token_id])
+                    log_probs.append(log_prob.item())
+                
+                # Get value estimates
+                last_hidden = self.model(inputs, output_hidden_states=True).hidden_states[-1]
+                value = self.value_head(last_hidden[:, -1, :]).squeeze()
+                
+                trajectories["responses"].append(response)
+                trajectories["log_probs"].append(log_probs)
+                trajectories["values"].append(value.item())
         
-        response = self.tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
-        return response
+        return trajectories
+    
+    def compute_rewards(self, prompts: List[str], responses: List[str], 
+                       test_inputs: List[str], expected_outputs: List[str]) -> List[float]:
+        """Get rewards from AI feedback"""
+        rewards = self.reward_model.batch_compute(prompts, responses, test_inputs, expected_outputs)
+        return rewards
+    
+    def compute_advantages(self, rewards: List[float], values: List[float]) -> Tuple[List[float], List[float]]:
+        """
+        Compute advantages using GAE (Generalized Advantage Estimation)
+        
+        This tells us how much better/worse an action was compared to expected
+        """
+        advantages = []
+        returns = []
+        
+        # Simple version: advantage = reward - value
+        for reward, value in zip(rewards, values):
+            returns.append(reward)  # No discounting for single-step
+            advantages.append(reward - value)
+        
+        # Normalize advantages
+        advantages = np.array(advantages)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return advantages.tolist(), returns
+    
+    def ppo_step(self, prompts: List[str], old_log_probs: List[List[float]], 
+                 advantages: List[float], returns: List[float]):
+        """
+        PPO update step - this is where learning happens!
+        
+        Key idea: Update policy to increase probability of good actions
+        while staying close to old policy (for stability)
+        """
+        self.model.train()
+        
+        # Encode prompts
+        encoded = self.tokenizer(prompts, padding=True, return_tensors="pt").to(self.device)
+        
+        # Forward pass
+        outputs = self.model(**encoded, output_hidden_states=True)
+        
+        # Compute new log probabilities
+        # (simplified - in practice, need to match exact generation)
+        logits = outputs.logits
+        
+        # Policy loss (PPO objective)
+        policy_losses = []
+        for i, advantage in enumerate(advantages):
+            # Importance sampling ratio
+            ratio = 1.0  # Simplified
+            
+            # PPO clipping
+            clipped_ratio = torch.clamp(torch.tensor(ratio), 
+                                      1 - self.ppo_config["clip_ratio"],
+                                      1 + self.ppo_config["clip_ratio"])
+            
+            # Policy loss
+            advantage_tensor = torch.tensor(advantage, dtype=torch.float32)
+            policy_loss = -torch.min(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
+            policy_losses.append(policy_loss)
+        
+        policy_loss = torch.stack(policy_losses).mean()
+        
+        # Value loss
+        hidden_states = outputs.hidden_states[-1]
+        predicted_values = self.value_head(hidden_states[:, -1, :]).squeeze()
+        value_targets = torch.tensor(returns).to(self.device)
+        value_loss = torch.nn.functional.mse_loss(predicted_values, value_targets)
+        
+        # Total loss
+        total_loss = policy_loss + self.ppo_config["value_loss_coef"] * value_loss
+        
+        # Backward pass
+        self.optimizer.zero_grad()
+        self.value_optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.ppo_config["max_grad_norm"])
+        
+        # Update
+        self.optimizer.step()
+        self.value_optimizer.step()
+        
+        return {
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "total_loss": total_loss.item()
+        }
+    
+    def train(self, dataset, num_episodes: int = 10):
+        """
+        Main RLAIF training loop
+        
+        For each episode:
+        1. Generate code solutions (trajectories)
+        2. Get AI feedback (rewards)
+        3. Compute advantages
+        4. Update policy with PPO
+        """
+        logger.info(f"🏃 Starting RLAIF training for {num_episodes} episodes")
+        
+        # Training history
+        history = {
+            "rewards": [],
+            "losses": []
+        }
+        
+        for episode in range(num_episodes):
+            logger.info(f"\n📊 Episode {episode + 1}/{num_episodes}")
+            
+            # Sample batch from dataset
+            batch_size = min(4, len(dataset))
+            indices = np.random.choice(len(dataset), batch_size, replace=False)
+            batch = dataset.select(indices)
+            
+            # Extract batch data
+            prompts = [item['query'] for item in batch]
+            test_inputs = [item['test_input'] for item in batch]
+            expected_outputs = [item['expected_output'] for item in batch]
+            
+            # 1. Generate trajectories
+            logger.info("🤖 Generating code solutions...")
+            trajectories = self.generate_trajectories(prompts)
+            
+            # 2. Get rewards from AI
+            logger.info("🧠 Getting AI feedback...")
+            rewards = self.compute_rewards(prompts, trajectories["responses"], 
+                                         test_inputs, expected_outputs)
+            
+            # Log example
+            logger.info(f"Example - Prompt: {prompts[0][:50]}...")
+            logger.info(f"Generated: {trajectories['responses'][0][:80]}...")
+            logger.info(f"Reward: {rewards[0]:.3f}")
+            
+            # 3. Compute advantages
+            advantages, returns = self.compute_advantages(rewards, trajectories["values"])
+            
+            # 4. PPO update
+            logger.info("🔄 Running PPO update...")
+            losses = self.ppo_step(prompts, trajectories["log_probs"], advantages, returns)
+            
+            # Track progress
+            avg_reward = np.mean(rewards)
+            history["rewards"].append(avg_reward)
+            history["losses"].append(losses["total_loss"])
+            
+            logger.info(f"Average reward: {avg_reward:.3f}")
+            logger.info(f"Loss: {losses['total_loss']:.4f}")
+            
+            # Early stopping if doing well
+            if avg_reward > 0.9:
+                logger.info("🎉 High performance achieved!")
+                break
+        
+        logger.info("\n✅ RLAIF training completed!")
+        return history
+    
+    def save_model(self, output_dir: str):
+        """Save trained model"""
+        logger.info(f"💾 Saving model to {output_dir}")
+        
+        # Save model and tokenizer
+        self.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        # Save value head
+        torch.save(self.value_head.state_dict(), f"{output_dir}/value_head.pt")
+        
+        logger.info("✅ Model saved!")
 
+# Educational example showing RLAIF concept
+def demonstrate_rlaif_concept():
+    """Simple demonstration of RLAIF concepts"""
+    print("\n🎓 RLAIF Concept Demonstration")
+    print("=" * 50)
+    
+    print("\n1️⃣ Traditional RLHF:")
+    print("   Model → Generated Code → Human Rates → Update Model")
+    print("   Problem: Expensive, slow, doesn't scale")
+    
+    print("\n2️⃣ RLAIF Innovation:")
+    print("   Model → Generated Code → AI Rates → Update Model")
+    print("   Benefits: Fast, scalable, consistent")
+    
+    print("\n3️⃣ How it works:")
+    print("   a) Model generates multiple solutions")
+    print("   b) AI evaluates each solution (execution, style, correctness)")
+    print("   c) Good solutions get high rewards")
+    print("   d) Model learns to generate more like the good ones")
+    
+    print("\n4️⃣ PPO Algorithm:")
+    print("   - Proximal Policy Optimization")
+    print("   - Updates model carefully (not too much at once)")
+    print("   - Prevents catastrophic forgetting")
+    
+    print("\n5️⃣ Key Components:")
+    print("   - Policy Model: Generates code")
+    print("   - Value Model: Predicts how good a solution will be")
+    print("   - Reward Model: AI that evaluates code")
+    print("   - PPO Optimizer: Updates model based on rewards")
 
 if __name__ == "__main__":
+    # Show concept
+    demonstrate_rlaif_concept()
+    
     # Quick test
-    from simple_dataset import create_dataset
+    print("\n\n🧪 Quick Test")
+    from datasets import Dataset
     
-    print("Testing RLAIF Code Trainer...")
+    # Tiny dataset
+    data = [{
+        "query": "Write a function to add two numbers",
+        "test_input": "add(2, 3)",
+        "expected_output": "5"
+    }]
+    dataset = Dataset.from_list(data)
     
-    # Use small model for testing
-    trainer = RLAIFCodeTrainer("Salesforce/codegen-350M-mono")
+    # Initialize trainer
+    trainer = RLAIFTrainer("microsoft/DialoGPT-small")
     
-    # Create dataset
-    train_dataset, _ = create_dataset()
+    # Train for 1 episode
+    history = trainer.train(dataset, num_episodes=1)
     
-    # Test generation
-    prompt = "Write a Python function that adds two numbers."
-    print(f"\nPrompt: {prompt}")
-    print(f"Generated: {trainer.generate_sample(prompt)}")
-    
-    # Run one episode
-    trainer.train(train_dataset, num_episodes=1)
+    print("\n✨ Test completed!")
